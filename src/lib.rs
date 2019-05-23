@@ -1,13 +1,9 @@
 use std::convert::TryInto;
 use std::io;
 
-// Potential issue, do we need to flush the TcpStream during handshake to speed things up.
-// It is prefferrable not to include anything tcp specific so we can be generic over
-// io::Read + io::Write. Maybe encourage the user to set tcp stream to immediate mode
-// before handshake?
-// Wait, flush is defined on the write trait. It's not tcp specific.
-
-struct EncryptedDuplexStream<Stream> {
+/// Wrapper around A stream implementing io::Read and io::Write.
+/// Data written to EncryptedDuplexStream is encrypted.
+pub struct EncryptedDuplexStream<Stream> {
     underlying: Stream,
     session: snow::Session,
 }
@@ -20,7 +16,7 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_initiator()
-            .unwrap();
+            .expect("build initiatior failed");
 
         // XX:
         handshake_send(&mut stream, &mut session)?; // -> e
@@ -42,7 +38,7 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_responder()
-            .unwrap();
+            .expect("build responder failed");
 
         // XX:
         handshake_recv(&mut stream, &mut session)?; // -> e
@@ -58,26 +54,32 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
     }
 
     /// Get the static public key of remote host
-    fn get_remote_static(&self) -> PublicKey {
-        PublicKey::from_slice(self.session.get_remote_static().unwrap())
+    pub fn get_remote_static(&self) -> PublicKey {
+        PublicKey::from_slice(
+            self.session
+                .get_remote_static()
+                .expect("remote static key not set"),
+        )
     }
 
     /// Encrypt and send one snow message.
     ///
     /// # Panics
     ///
-    /// panics if buf.len() > 65535
-    fn send(&mut self, buf: &[u8]) -> io::Result<()> {
+    /// panics if buf.len() > 65535 - 16
+    pub fn send(&mut self, buf: &[u8]) -> io::Result<()> {
+        assert!(buf.len() <= 65535 - 16);
         let mut encbuf = [0u8; 65535];
         let len = self
             .session
             .write_message(buf, &mut encbuf)
             .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+        debug_assert_eq!(len, buf.len() + 16);
         put_message(&mut self.underlying, &encbuf[..len])
     }
 
     /// Recive one entire snow message.
-    fn recv(&mut self, buf: &mut [u8; 65535]) -> io::Result<usize> {
+    pub fn recv(&mut self, buf: &mut [u8; 65519]) -> io::Result<usize> {
         let mut encbuf = [0u8; 65535];
         let enclen = get_message(&mut self.underlying, &mut encbuf)?;
         self.session
@@ -114,11 +116,17 @@ impl PublicKey {
 }
 
 fn builder() -> snow::Builder<'static> {
-    snow::Builder::new("Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap())
+    snow::Builder::new(
+        "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+            .parse()
+            .expect("failed to parse noise protocol description"),
+    )
 }
 
 pub fn generate_keypair() -> (SecretKey, PublicKey) {
-    let kp = builder().generate_keypair().unwrap();
+    let kp = builder()
+        .generate_keypair()
+        .expect("gernerate keypair failed");
     (
         SecretKey::from_slice(&kp.private),
         PublicKey::from_slice(&kp.public),
@@ -140,7 +148,7 @@ fn get_message<Stream: io::Read + io::Write>(
 ///
 /// panics if buf.len() > 65535
 fn put_message<Stream: io::Read + io::Write>(stream: &mut Stream, buf: &[u8]) -> io::Result<()> {
-    let len: u16 = buf.len().try_into().unwrap();
+    let len: u16 = buf.len().try_into().expect("buffer too large");
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(&buf)?;
     Ok(())
@@ -186,7 +194,7 @@ fn is_handshake_state(session: &snow::Session) -> bool {
 mod tests {
     use super::*;
     use std::io;
-    use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::thread;
 
     fn server_client<
@@ -197,16 +205,26 @@ mod tests {
         cf: ClientF,
     ) {
         // listen on loopback on ephemeral port
-        let listener = TcpListener::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)).unwrap();
+        let listener = TcpListener::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
+            .expect("failed to bind port");
         // get listen address
-        let listener_addr = listener.local_addr().unwrap();
+        let listener_addr = listener
+            .local_addr()
+            .expect("listener has no local address?");
         // start server thread listening on listener
-        let server = thread::spawn(move || sf(listener));
+        let server = thread::Builder::new()
+            .name("server".to_string())
+            .spawn(move || sf(listener))
+            .expect("failed to spawn server thread");
 
         // start client thread with address to serve
-        cf(listener_addr);
+        let client = thread::Builder::new()
+            .name("client".to_string())
+            .spawn(move || cf(listener_addr))
+            .expect("failed to spawn client thread");
 
-        server.join().unwrap();
+        server.join().expect("server thread panicked");
+        client.join().expect("client thread panicked");
     }
 
     trait Stream: io::Read + io::Write {}
@@ -223,11 +241,15 @@ mod tests {
         // we use tcp just because it's easy
         server_client(
             move |listener| {
-                let tcpstream = listener.accept().unwrap().0;
+                let tcpstream = listener
+                    .accept()
+                    .expect("server received no connection or accept failed")
+                    .0;
                 sf(Box::new(tcpstream));
             },
             move |listener_addr| {
-                let tcpstream = TcpStream::connect(listener_addr).unwrap();
+                let tcpstream =
+                    TcpStream::connect(listener_addr).expect("client failed to connect to server");
                 cf(Box::new(tcpstream));
             },
         );
@@ -240,11 +262,13 @@ mod tests {
 
         server_client_generic(
             move |stream| {
-                let enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk).unwrap();
+                let enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                    .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), client_pk);
             },
             move |stream| {
-                let enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk).unwrap();
+                let enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                    .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), server_pk);
             },
         );
@@ -255,25 +279,59 @@ mod tests {
         let (server_sk, _server_pk) = generate_keypair();
         let (client_sk, _client_pk) = generate_keypair();
 
-        let len_to_test: Vec<u16> = vec![0u16, 0u16, 65535u16, 65535u16, 65534u16];
-        let len_to_test_cpy: Vec<u16> = len_to_test.clone();
+        let len_to_test: Vec<usize> = vec![0, 65519, 65518];
+        let len_to_test_cpy: Vec<usize> = len_to_test.clone();
 
         server_client_generic(
             move |stream| {
-                let mut enc =
-                    EncryptedDuplexStream::responder_handshake(stream, &server_sk).unwrap();
-                let mut buf = [0u8; 65535];
+                let mut enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                    .expect("handshake failed");
+                let mut buf = [0u8; 65519];
                 for i in &len_to_test {
-                    println!("{}", i);
-                    let len = enc.recv(&mut buf).unwrap();
-                    assert_eq!(len, *i as usize);
+                    let len = enc.recv(&mut buf).expect("recv failed");
+                    assert_eq!(len, *i);
                 }
             },
             move |stream| {
-                let mut enc =
-                    EncryptedDuplexStream::initiatior_handshake(stream, &client_sk).unwrap();
+                let mut enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                    .expect("handshake failed");
                 for i in &len_to_test_cpy {
-                    let _len = enc.send(&[1u8; 65535][..(*i as usize)]).unwrap();
+                    let _len = enc.send(&[1u8; 65519][..(*i)]).expect("send failed");
+                }
+            },
+        );
+    }
+
+    fn server_client_post_handshake<
+        ServeF: 'static + Fn(EncryptedDuplexStream<Box<Stream>>) + Sync + Send,
+        ClientF: 'static + Fn(EncryptedDuplexStream<Box<Stream>>) + Sync + Send,
+    >(
+        sf: ServeF,
+        cf: ClientF,
+    ) {
+        let (server_sk, _server_pk) = generate_keypair();
+        let (client_sk, _client_pk) = generate_keypair();
+
+        server_client_generic(
+            move |stream| {
+                sf(EncryptedDuplexStream::responder_handshake(stream, &server_sk).unwrap())
+            },
+            move |stream| {
+                cf(EncryptedDuplexStream::initiatior_handshake(stream, &client_sk).unwrap())
+            },
+        );
+    }
+
+    #[test]
+    fn many_bytes() {
+        server_client_post_handshake(
+            |mut encstream| {
+                let mut buf = [0u8; 65519];
+                while let Ok(_) = encstream.recv(&mut buf) {}
+            },
+            |mut encstream| {
+                for _ in 0..1000 {
+                    encstream.send(&[2u8; 65519]).unwrap();
                 }
             },
         );
