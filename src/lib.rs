@@ -1,5 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::io;
+use std::str::FromStr;
 
 /// Wrapper around A stream implementing io::Read and io::Write.
 /// Data written to EncryptedDuplexStream is encrypted.
@@ -88,7 +90,8 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
     }
 }
 
-pub struct SecretKey([u8; 32]);
+#[derive(Serialize, Deserialize)]
+pub struct SecretKey(pub [u8; 32]);
 
 impl SecretKey {
     /// # Panics
@@ -101,8 +104,8 @@ impl SecretKey {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct PublicKey([u8; 32]);
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
+pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
     /// # Panics
