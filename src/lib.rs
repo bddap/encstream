@@ -1,7 +1,8 @@
+use either::Either;
 use serde::{Deserialize, Serialize};
+use snow::error::SnowError;
 use std::convert::TryInto;
 use std::io;
-use std::str::FromStr;
 
 /// Wrapper around A stream implementing io::Read and io::Write.
 /// Data written to EncryptedDuplexStream is encrypted.
@@ -14,7 +15,7 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
     pub fn initiatior_handshake(
         mut stream: Stream,
         sk: &SecretKey,
-    ) -> io::Result<EncryptedDuplexStream<Stream>> {
+    ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_initiator()
@@ -27,16 +28,14 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
 
         Ok(EncryptedDuplexStream {
             underlying: stream,
-            session: session
-                .into_transport_mode()
-                .map_err(|_| io::Error::from(io::ErrorKind::Other))?,
+            session: session.into_transport_mode().map_err(Either::Right)?,
         })
     }
 
     pub fn responder_handshake(
         mut stream: Stream,
         sk: &SecretKey,
-    ) -> io::Result<EncryptedDuplexStream<Stream>> {
+    ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_responder()
@@ -49,12 +48,12 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
 
         Ok(EncryptedDuplexStream {
             underlying: stream,
-            session: session
-                .into_transport_mode()
-                .map_err(|_| io::Error::from(io::ErrorKind::Other))?,
+            session: session.into_transport_mode().map_err(Either::Right)?,
         })
     }
+}
 
+impl<T> EncryptedDuplexStream<T> {
     /// Get the static public key of remote host
     pub fn get_remote_static(&self) -> PublicKey {
         PublicKey::from_slice(
@@ -63,30 +62,34 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
                 .expect("remote static key not set"),
         )
     }
+}
 
+impl<W: io::Write> EncryptedDuplexStream<W> {
     /// Encrypt and send one snow message.
     ///
     /// # Panics
     ///
     /// panics if buf.len() > 65535 - 16
-    pub fn send(&mut self, buf: &[u8]) -> io::Result<()> {
+    pub fn send(&mut self, buf: &[u8]) -> Result<(), Either<io::Error, SnowError>> {
         assert!(buf.len() <= 65535 - 16);
         let mut encbuf = [0u8; 65535];
         let len = self
             .session
             .write_message(buf, &mut encbuf)
-            .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
+            .map_err(Either::Right)?;
         debug_assert_eq!(len, buf.len() + 16);
-        put_message(&mut self.underlying, &encbuf[..len])
+        put_message(&mut self.underlying, &encbuf[..len]).map_err(Either::Left)
     }
+}
 
+impl<R: io::Read> EncryptedDuplexStream<R> {
     /// Recive one entire snow message.
-    pub fn recv(&mut self, buf: &mut [u8; 65519]) -> io::Result<usize> {
+    pub fn recv(&mut self, buf: &mut [u8; 65519]) -> Result<usize, Either<io::Error, SnowError>> {
         let mut encbuf = [0u8; 65535];
-        let enclen = get_message(&mut self.underlying, &mut encbuf)?;
+        let enclen = get_message(&mut self.underlying, &mut encbuf).map_err(Either::Left)?;
         self.session
             .read_message(&encbuf[..enclen], buf)
-            .map_err(|_| io::Error::from(io::ErrorKind::Other))
+            .map_err(Either::Right)
     }
 }
 
@@ -136,10 +139,7 @@ pub fn generate_keypair() -> (SecretKey, PublicKey) {
     )
 }
 
-fn get_message<Stream: io::Read + io::Write>(
-    stream: &mut Stream,
-    buf: &mut [u8; 65535],
-) -> io::Result<usize> {
+fn get_message<R: io::Read>(stream: &mut R, buf: &mut [u8; 65535]) -> io::Result<usize> {
     let mut two_bytes = [0u8; 2];
     stream.read_exact(&mut two_bytes)?;
     let len = u16::from_be_bytes(two_bytes) as usize;
@@ -150,7 +150,7 @@ fn get_message<Stream: io::Read + io::Write>(
 /// # Panics
 ///
 /// panics if buf.len() > 65535
-fn put_message<Stream: io::Read + io::Write>(stream: &mut Stream, buf: &[u8]) -> io::Result<()> {
+fn put_message<W: io::Write>(stream: &mut W, buf: &[u8]) -> io::Result<()> {
     let len: u16 = buf.len().try_into().expect("buffer too large");
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(&buf)?;
@@ -159,31 +159,31 @@ fn put_message<Stream: io::Read + io::Write>(stream: &mut Stream, buf: &[u8]) ->
 
 // read message and drop payload if any
 // used when executing noise protocol handshake
-fn handshake_recv<Stream: io::Read + io::Write>(
-    stream: &mut Stream,
+fn handshake_recv<R: io::Read>(
+    stream: &mut R,
     session: &mut snow::Session,
-) -> io::Result<()> {
+) -> Result<(), Either<io::Error, SnowError>> {
     debug_assert!(is_handshake_state(session));
     let mut buf = [0u8; 65535];
     let mut throw_away = [0u8; 65535];
-    let len = get_message(stream, &mut buf)?;
+    let len = get_message(stream, &mut buf).map_err(Either::Left)?;
     session
         .read_message(&buf[..len], &mut throw_away)
-        .map_err(|_| io::Error::from(io::ErrorKind::Other))
+        .map_err(Either::Right)
         .map(|_| ())
 }
 
-fn handshake_send<Stream: io::Read + io::Write>(
-    stream: &mut Stream,
+fn handshake_send<W: io::Write>(
+    stream: &mut W,
     session: &mut snow::Session,
-) -> io::Result<()> {
+) -> Result<(), Either<io::Error, SnowError>> {
     debug_assert!(is_handshake_state(session));
     let mut buf = [0u8; 65535];
     let len = session
         .write_message(&[], &mut buf)
-        .map_err(|_| io::Error::from(io::ErrorKind::Other))?;
-    put_message(stream, &buf[..len])?;
-    stream.flush()
+        .map_err(Either::Right)?;
+    put_message(stream, &buf[..len]).map_err(Either::Left)?;
+    stream.flush().map_err(Either::Left)
 }
 
 fn is_handshake_state(session: &snow::Session) -> bool {
@@ -333,7 +333,7 @@ mod tests {
                 while let Ok(_) = encstream.recv(&mut buf) {}
             },
             |mut encstream| {
-                for _ in 0..1000 {
+                for _ in 0..100 {
                     encstream.send(&[2u8; 65519]).unwrap();
                 }
             },
