@@ -1,3 +1,8 @@
+#![feature(async_await)]
+
+mod crypt;
+mod fragment;
+
 use either::Either;
 use serde::{Deserialize, Serialize};
 use snow::error::SnowError;

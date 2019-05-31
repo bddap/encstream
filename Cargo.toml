@@ -8,6 +8,12 @@ edition = "2018"
 snow = "0.5.2"
 serde = { version = "1.0", features = ["derive"] }
 either = "1.5.2"
+romio = "0.3.0-alpha.8"
+
+[dependencies.futures]
+version = "0.3.0-alpha.16"
+package = "futures-preview"
+features = ["async-await", "nightly"]
 
 [dev-dependencies]
 structopt = "0.2.15"
