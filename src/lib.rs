@@ -1,23 +1,28 @@
 #![feature(async_await)]
 
+mod builder;
 mod crypt;
 mod fragment;
+mod keys;
 
+pub use crate::keys::{generate_keypair, PublicKey, SecretKey};
+
+use crate::builder::builder;
+use crate::crypt::decrypt_read;
+use crate::crypt::encrypt_write;
 use either::Either;
-use serde::{Deserialize, Serialize};
+use futures::{AsyncRead, AsyncWrite};
 use snow::error::SnowError;
-use std::convert::TryInto;
 use std::io;
 
-/// Wrapper around A stream implementing io::Read and io::Write.
-/// Data written to EncryptedDuplexStream is encrypted.
+/// Transformation on a read write stream, encrypts reads and writes.
 pub struct EncryptedDuplexStream<Stream> {
     underlying: Stream,
     session: snow::Session,
 }
 
-impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
-    pub fn initiatior_handshake(
+impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
+    pub async fn initiatior_handshake(
         mut stream: Stream,
         sk: &SecretKey,
     ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
@@ -27,9 +32,16 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
             .expect("build initiatior failed");
 
         // XX:
-        handshake_send(&mut stream, &mut session)?; // -> e
-        handshake_recv(&mut stream, &mut session)?; // <- e, ee, s, es
-        handshake_send(&mut stream, &mut session)?; // -> s, se
+        // -> e
+        handshake_send(&mut stream, &mut session)
+            .await
+            .map_err(Either::Left)?;
+        // <- e, ee, s, es
+        handshake_recv(&mut stream, &mut session).await?;
+        // -> s, se
+        handshake_send(&mut stream, &mut session)
+            .await
+            .map_err(Either::Left)?;
 
         Ok(EncryptedDuplexStream {
             underlying: stream,
@@ -37,7 +49,7 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
         })
     }
 
-    pub fn responder_handshake(
+    pub async fn responder_handshake(
         mut stream: Stream,
         sk: &SecretKey,
     ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
@@ -47,18 +59,21 @@ impl<Stream: io::Read + io::Write> EncryptedDuplexStream<Stream> {
             .expect("build responder failed");
 
         // XX:
-        handshake_recv(&mut stream, &mut session)?; // -> e
-        handshake_send(&mut stream, &mut session)?; // <- e, ee, s, es
-        handshake_recv(&mut stream, &mut session)?; // -> s, se
+        // -> e
+        handshake_recv(&mut stream, &mut session).await?;
+        // <- e, ee, s, es
+        handshake_send(&mut stream, &mut session)
+            .await
+            .map_err(Either::Left)?;
+        // -> s, se
+        handshake_recv(&mut stream, &mut session).await?;
 
         Ok(EncryptedDuplexStream {
             underlying: stream,
             session: session.into_transport_mode().map_err(Either::Right)?,
         })
     }
-}
 
-impl<T> EncryptedDuplexStream<T> {
     /// Get the static public key of remote host
     pub fn get_remote_static(&self) -> PublicKey {
         PublicKey::from_slice(
@@ -67,128 +82,39 @@ impl<T> EncryptedDuplexStream<T> {
                 .expect("remote static key not set"),
         )
     }
-}
 
-impl<W: io::Write> EncryptedDuplexStream<W> {
-    /// Encrypt and send one snow message.
-    ///
     /// # Panics
     ///
-    /// panics if buf.len() > 65535 - 16
-    pub fn send(&mut self, buf: &[u8]) -> Result<(), Either<io::Error, SnowError>> {
-        assert!(buf.len() <= 65535 - 16);
-        let mut encbuf = [0u8; 65535];
-        let len = self
-            .session
-            .write_message(buf, &mut encbuf)
-            .map_err(Either::Right)?;
-        debug_assert_eq!(len, buf.len() + 16);
-        put_message(&mut self.underlying, &encbuf[..len]).map_err(Either::Left)
+    /// Panics if message.len() > 65519
+    pub async fn send<'a>(&'a mut self, message: &'a [u8]) -> Result<(), io::Error> {
+        encrypt_write(&mut self.underlying, &mut self.session, message).await
     }
-}
 
-impl<R: io::Read> EncryptedDuplexStream<R> {
-    /// Recive one entire snow message.
-    pub fn recv(&mut self, buf: &mut [u8; 65519]) -> Result<usize, Either<io::Error, SnowError>> {
-        let mut encbuf = [0u8; 65535];
-        let enclen = get_message(&mut self.underlying, &mut encbuf).map_err(Either::Left)?;
-        self.session
-            .read_message(&encbuf[..enclen], buf)
-            .map_err(Either::Right)
+    pub async fn recv<'a>(
+        &'a mut self,
+        message: &'a mut [u8; 65519],
+    ) -> Result<usize, Either<io::Error, SnowError>> {
+        decrypt_read(&mut self.underlying, &mut self.session, message).await
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct SecretKey(pub [u8; 32]);
-
-impl SecretKey {
-    /// # Panics
-    ///
-    /// panics if slice.len() is not 32
-    fn from_slice(slice: &[u8]) -> Self {
-        let mut ret = [0u8; 32];
-        ret.copy_from_slice(slice);
-        Self(ret)
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
-pub struct PublicKey(pub [u8; 32]);
-
-impl PublicKey {
-    /// # Panics
-    ///
-    /// panics if slice.len() is not 32
-    fn from_slice(slice: &[u8]) -> Self {
-        let mut ret = [0u8; 32];
-        ret.copy_from_slice(slice);
-        Self(ret)
-    }
-}
-
-fn builder() -> snow::Builder<'static> {
-    snow::Builder::new(
-        "Noise_XX_25519_ChaChaPoly_BLAKE2s"
-            .parse()
-            .expect("failed to parse noise protocol description"),
-    )
-}
-
-pub fn generate_keypair() -> (SecretKey, PublicKey) {
-    let kp = builder()
-        .generate_keypair()
-        .expect("gernerate keypair failed");
-    (
-        SecretKey::from_slice(&kp.private),
-        PublicKey::from_slice(&kp.public),
-    )
-}
-
-fn get_message<R: io::Read>(stream: &mut R, buf: &mut [u8; 65535]) -> io::Result<usize> {
-    let mut two_bytes = [0u8; 2];
-    stream.read_exact(&mut two_bytes)?;
-    let len = u16::from_be_bytes(two_bytes) as usize;
-    stream.read_exact(&mut buf[..len])?;
-    Ok(len)
-}
-
-/// # Panics
-///
-/// panics if buf.len() > 65535
-fn put_message<W: io::Write>(stream: &mut W, buf: &[u8]) -> io::Result<()> {
-    let len: u16 = buf.len().try_into().expect("buffer too large");
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&buf)?;
-    Ok(())
 }
 
 // read message and drop payload if any
 // used when executing noise protocol handshake
-fn handshake_recv<R: io::Read>(
-    stream: &mut R,
-    session: &mut snow::Session,
+async fn handshake_recv<'a, R: AsyncRead + Unpin>(
+    stream: &'a mut R,
+    session: &'a mut snow::Session,
 ) -> Result<(), Either<io::Error, SnowError>> {
     debug_assert!(is_handshake_state(session));
-    let mut buf = [0u8; 65535];
-    let mut throw_away = [0u8; 65535];
-    let len = get_message(stream, &mut buf).map_err(Either::Left)?;
-    session
-        .read_message(&buf[..len], &mut throw_away)
-        .map_err(Either::Right)
-        .map(|_| ())
+    let mut trash = [0u8; 65519];
+    decrypt_read(stream, session, &mut trash).await.map(|_| ())
 }
 
-fn handshake_send<W: io::Write>(
-    stream: &mut W,
-    session: &mut snow::Session,
-) -> Result<(), Either<io::Error, SnowError>> {
+async fn handshake_send<'a, W: AsyncWrite + Unpin>(
+    stream: &'a mut W,
+    session: &'a mut snow::Session,
+) -> Result<(), io::Error> {
     debug_assert!(is_handshake_state(session));
-    let mut buf = [0u8; 65535];
-    let len = session
-        .write_message(&[], &mut buf)
-        .map_err(Either::Right)?;
-    put_message(stream, &buf[..len]).map_err(Either::Left)?;
-    stream.flush().map_err(Either::Left)
+    encrypt_write(stream, session, &[]).await
 }
 
 fn is_handshake_state(session: &snow::Session) -> bool {
@@ -201,9 +127,25 @@ fn is_handshake_state(session: &snow::Session) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use crate::keys::generate_keypair;
+    use futures::executor::block_on;
+    use futures_util::stream::StreamExt;
+    use romio::{TcpListener, TcpStream};
+    use std::future::Future;
+    use std::net::{Ipv6Addr, SocketAddr};
     use std::thread;
+
+    trait ChottoMatte {
+        type Item;
+        fn wait(self) -> Self::Item;
+    }
+
+    impl<F: Future> ChottoMatte for F {
+        type Item = F::Output;
+        fn wait(self) -> F::Output {
+            block_on(self)
+        }
+    }
 
     fn server_client<
         ServeF: 'static + Fn(TcpListener) + Sync + Send,
@@ -213,7 +155,7 @@ mod tests {
         cf: ClientF,
     ) {
         // listen on loopback on ephemeral port
-        let listener = TcpListener::bind(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
+        let listener = TcpListener::bind(&SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
             .expect("failed to bind port");
         // get listen address
         let listener_addr = listener
@@ -235,29 +177,31 @@ mod tests {
         client.join().expect("client thread panicked");
     }
 
-    trait Stream: io::Read + io::Write {}
-
+    trait Stream: AsyncRead + AsyncWrite + Unpin {}
     impl Stream for TcpStream {}
 
     fn server_client_generic<
-        ServeF: 'static + Fn(Box<Stream>) + Sync + Send,
-        ClientF: 'static + Fn(Box<Stream>) + Sync + Send,
+        ServeF: 'static + Fn(Box<dyn Stream>) + Sync + Send,
+        ClientF: 'static + Fn(Box<dyn Stream>) + Sync + Send,
     >(
         sf: ServeF,
         cf: ClientF,
     ) {
         // we use tcp just because it's easy
         server_client(
-            move |listener| {
+            move |mut listener| {
                 let tcpstream = listener
-                    .accept()
+                    .incoming()
+                    .next()
+                    .wait()
                     .expect("server received no connection or accept failed")
-                    .0;
+                    .expect("server got a stream, but some other failure occured");
                 sf(Box::new(tcpstream));
             },
             move |listener_addr| {
-                let tcpstream =
-                    TcpStream::connect(listener_addr).expect("client failed to connect to server");
+                let tcpstream = TcpStream::connect(&listener_addr)
+                    .wait()
+                    .expect("client failed to connect to server");
                 cf(Box::new(tcpstream));
             },
         );
@@ -271,11 +215,13 @@ mod tests {
         server_client_generic(
             move |stream| {
                 let enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                    .wait()
                     .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), client_pk);
             },
             move |stream| {
                 let enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                    .wait()
                     .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), server_pk);
             },
@@ -293,26 +239,28 @@ mod tests {
         server_client_generic(
             move |stream| {
                 let mut enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                    .wait()
                     .expect("handshake failed");
                 let mut buf = [0u8; 65519];
                 for i in &len_to_test {
-                    let len = enc.recv(&mut buf).expect("recv failed");
+                    let len = enc.recv(&mut buf).wait().expect("recv failed");
                     assert_eq!(len, *i);
                 }
             },
             move |stream| {
                 let mut enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                    .wait()
                     .expect("handshake failed");
                 for i in &len_to_test_cpy {
-                    let _len = enc.send(&[1u8; 65519][..(*i)]).expect("send failed");
+                    let _len = enc.send(&[1u8; 65519][..(*i)]).wait().expect("send failed");
                 }
             },
         );
     }
 
     fn server_client_post_handshake<
-        ServeF: 'static + Fn(EncryptedDuplexStream<Box<Stream>>) + Sync + Send,
-        ClientF: 'static + Fn(EncryptedDuplexStream<Box<Stream>>) + Sync + Send,
+        ServeF: 'static + Fn(EncryptedDuplexStream<Box<dyn Stream>>) + Sync + Send,
+        ClientF: 'static + Fn(EncryptedDuplexStream<Box<dyn Stream>>) + Sync + Send,
     >(
         sf: ServeF,
         cf: ClientF,
@@ -322,10 +270,18 @@ mod tests {
 
         server_client_generic(
             move |stream| {
-                sf(EncryptedDuplexStream::responder_handshake(stream, &server_sk).unwrap())
+                sf(
+                    EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                        .wait()
+                        .unwrap(),
+                )
             },
             move |stream| {
-                cf(EncryptedDuplexStream::initiatior_handshake(stream, &client_sk).unwrap())
+                cf(
+                    EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                        .wait()
+                        .unwrap(),
+                )
             },
         );
     }
@@ -335,11 +291,11 @@ mod tests {
         server_client_post_handshake(
             |mut encstream| {
                 let mut buf = [0u8; 65519];
-                while let Ok(_) = encstream.recv(&mut buf) {}
+                while let Ok(_) = encstream.recv(&mut buf).wait() {}
             },
             |mut encstream| {
                 for _ in 0..100 {
-                    encstream.send(&[2u8; 65519]).unwrap();
+                    encstream.send(&[2u8; 65519]).wait().unwrap();
                 }
             },
         );

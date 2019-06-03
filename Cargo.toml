@@ -15,6 +15,10 @@ version = "0.3.0-alpha.16"
 package = "futures-preview"
 features = ["async-await", "nightly"]
 
+[dependencies.futures_util]
+version = "0.3.0-alpha.16"
+package = "futures-util-preview"
+
 [dev-dependencies]
 structopt = "0.2.15"
 serde_json = { version = "1" }

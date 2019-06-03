@@ -10,13 +10,13 @@ pub async fn encrypt_write<'a, W: AsyncWrite + Unpin>(
     w: &'a mut W,
     session: &'a mut Session,
     plaintext: &'a [u8],
-) -> Result<(), Either<io::Error, SnowError>> {
+) -> Result<(), io::Error> {
     assert!(plaintext.len() <= 65519);
     let mut buf = [0u8; 65535];
     let len = session
         .write_message(plaintext, &mut buf)
-        .map_err(Either::Right)?;
-    write_noise(w, &buf[..len]).await.map_err(Either::Left)
+        .expect("Output exceeded the max message length for the Noise Protocol (65535 bytes).");
+    write_noise(w, &buf[..len]).await
 }
 
 pub async fn decrypt_read<'a, R: AsyncRead + Unpin>(

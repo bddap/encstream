@@ -13,7 +13,7 @@ pub async fn write_noise<'a, W: AsyncWrite + Unpin>(
     let mut buf = [0u8; 65537];
     buf[..2].copy_from_slice(&len.to_be_bytes());
     buf[2..message.len() + 2].copy_from_slice(&message);
-    w.write_all(&buf).await
+    w.write_all(&buf[..message.len() + 2]).await
 }
 
 pub async fn read_noise<'a, R: AsyncRead + Unpin>(
