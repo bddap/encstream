@@ -91,12 +91,12 @@ async fn async_main() {
         } => {
             // read private key from file
             let sk = load_keypair(&path_to_keypair).secret;
-
+            
             // listen on port on all interfaces
             let mut listener =
                 TcpListener::bind(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
                     .expect("could not bind address");
-
+            
             // accept connections until a connection from authorized_host is recieved
             let mut incoming = listener.incoming();
             while let Some(tcp_stream) = incoming
