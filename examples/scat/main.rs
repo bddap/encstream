@@ -5,7 +5,7 @@
 mod encoding;
 
 use crate::encoding::{pk_from_hex, pk_to_hex};
-use encstream::{generate_keypair, EncryptedDuplexStream, PublicKey, SecretKey};
+use encstream::{generate_keypair, EncStream, PublicKey, SecretKey};
 use futures::executor::block_on;
 use futures::{AsyncRead, AsyncWrite};
 use futures_util::stream::StreamExt;
@@ -91,12 +91,12 @@ async fn async_main() {
         } => {
             // read private key from file
             let sk = load_keypair(&path_to_keypair).secret;
-            
+
             // listen on port on all interfaces
             let mut listener =
                 TcpListener::bind(&SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))
                     .expect("could not bind address");
-            
+
             // accept connections until a connection from authorized_host is recieved
             let mut incoming = listener.incoming();
             while let Some(tcp_stream) = incoming
@@ -104,7 +104,7 @@ async fn async_main() {
                 .await
                 .map(|tcp_stream| tcp_stream.expect("error listening for tcp connection"))
             {
-                match EncryptedDuplexStream::responder_handshake(tcp_stream, &sk).await {
+                match EncStream::responder_handshake(tcp_stream, &sk).await {
                     Ok(mut enc_stream) => {
                         if enc_stream.get_remote_static() == authorized_host {
                             // xfer
@@ -133,7 +133,7 @@ async fn async_main() {
                 .expect("cannot connect to remote host");
 
             // panic if hanshake fails
-            let mut enc_stream = EncryptedDuplexStream::initiatior_handshake(tcp_stream, &sk)
+            let mut enc_stream = EncStream::initiatior_handshake(tcp_stream, &sk)
                 .await
                 .expect("handshake failed");
 
@@ -164,7 +164,7 @@ fn load_keypair(path: &PathBuf) -> Keypair {
 
 async fn send<'a, R: io::Read, Stream: AsyncWrite + AsyncRead + Unpin>(
     inp: &'a mut R,
-    stream: &'a mut EncryptedDuplexStream<Stream>,
+    stream: &'a mut EncStream<Stream>,
 ) {
     let mut buf = [0u8; 65519];
     loop {
@@ -186,7 +186,7 @@ async fn send<'a, R: io::Read, Stream: AsyncWrite + AsyncRead + Unpin>(
 
 async fn recv<'a, W: io::Write, Stream: AsyncWrite + AsyncRead + Unpin>(
     out: &'a mut W,
-    stream: &'a mut EncryptedDuplexStream<Stream>,
+    stream: &'a mut EncStream<Stream>,
 ) {
     let mut buf = [0u8; 65519];
     loop {

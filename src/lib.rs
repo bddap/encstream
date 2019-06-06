@@ -11,21 +11,25 @@ use crate::builder::builder;
 use crate::crypt::decrypt_read;
 use crate::crypt::encrypt_write;
 use either::Either;
-use futures::{AsyncRead, AsyncWrite};
+use futures::io::{ReadHalf, WriteHalf};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use snow::error::SnowError;
 use std::io;
 
 /// Transformation on a read write stream, encrypts reads and writes.
-pub struct EncryptedDuplexStream<Stream> {
+pub struct EncStream<Stream> {
     underlying: Stream,
     session: snow::Session,
 }
 
-impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
+impl<Stream: Unpin> EncStream<Stream> {
     pub async fn initiatior_handshake(
         mut stream: Stream,
         sk: &SecretKey,
-    ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
+    ) -> Result<EncStream<Stream>, Either<io::Error, SnowError>>
+    where
+        Stream: AsyncRead + AsyncWrite,
+    {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_initiator()
@@ -43,7 +47,7 @@ impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
             .await
             .map_err(Either::Left)?;
 
-        Ok(EncryptedDuplexStream {
+        Ok(EncStream {
             underlying: stream,
             session: session.into_transport_mode().map_err(Either::Right)?,
         })
@@ -52,7 +56,10 @@ impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
     pub async fn responder_handshake(
         mut stream: Stream,
         sk: &SecretKey,
-    ) -> Result<EncryptedDuplexStream<Stream>, Either<io::Error, SnowError>> {
+    ) -> Result<EncStream<Stream>, Either<io::Error, SnowError>>
+    where
+        Stream: AsyncRead + AsyncWrite,
+    {
         let mut session = builder()
             .local_private_key(&sk.0)
             .build_responder()
@@ -68,7 +75,7 @@ impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
         // -> s, se
         handshake_recv(&mut stream, &mut session).await?;
 
-        Ok(EncryptedDuplexStream {
+        Ok(EncStream {
             underlying: stream,
             session: session.into_transport_mode().map_err(Either::Right)?,
         })
@@ -86,20 +93,44 @@ impl<Stream: AsyncWrite + AsyncRead + Unpin> EncryptedDuplexStream<Stream> {
     /// # Panics
     ///
     /// Panics if message.len() > 65519
-    pub async fn send<'a>(&'a mut self, message: &'a [u8]) -> Result<(), io::Error> {
+    pub async fn send<'a>(&'a mut self, message: &'a [u8]) -> Result<(), io::Error>
+    where
+        Stream: AsyncWrite,
+    {
         encrypt_write(&mut self.underlying, &mut self.session, message).await
     }
 
     pub async fn recv<'a>(
         &'a mut self,
         message: &'a mut [u8; 65519],
-    ) -> Result<usize, Either<io::Error, SnowError>> {
+    ) -> Result<usize, Either<io::Error, SnowError>>
+    where
+        Stream: AsyncRead,
+    {
         decrypt_read(&mut self.underlying, &mut self.session, message).await
+    }
+
+    /// Split stream into a read half and a write half.
+    fn split(self) -> (EncStream<ReadHalf<Stream>>, EncStream<WriteHalf<Stream>>)
+    where
+        Stream: AsyncWrite + AsyncRead,
+    {
+        let (read, write) = self.underlying.split();
+        (
+            EncStream {
+                underlying: read,
+                session: self.session,
+            },
+            EncStream {
+                underlying: write,
+                session: unimplemented!(),
+            },
+        )
     }
 }
 
-// read message and drop payload if any
-// used when executing noise protocol handshake
+/// read message and drop payload if any.
+/// used when executing noise protocol handshake.
 async fn handshake_recv<'a, R: AsyncRead + Unpin>(
     stream: &'a mut R,
     session: &'a mut snow::Session,
@@ -214,13 +245,13 @@ mod tests {
 
         server_client_generic(
             move |stream| {
-                let enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                let enc = EncStream::responder_handshake(stream, &server_sk)
                     .wait()
                     .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), client_pk);
             },
             move |stream| {
-                let enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                let enc = EncStream::initiatior_handshake(stream, &client_sk)
                     .wait()
                     .expect("handshake failed");
                 assert_eq!(enc.get_remote_static(), server_pk);
@@ -238,7 +269,7 @@ mod tests {
 
         server_client_generic(
             move |stream| {
-                let mut enc = EncryptedDuplexStream::responder_handshake(stream, &server_sk)
+                let mut enc = EncStream::responder_handshake(stream, &server_sk)
                     .wait()
                     .expect("handshake failed");
                 let mut buf = [0u8; 65519];
@@ -248,7 +279,7 @@ mod tests {
                 }
             },
             move |stream| {
-                let mut enc = EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
+                let mut enc = EncStream::initiatior_handshake(stream, &client_sk)
                     .wait()
                     .expect("handshake failed");
                 for i in &len_to_test_cpy {
@@ -259,8 +290,8 @@ mod tests {
     }
 
     fn server_client_post_handshake<
-        ServeF: 'static + Fn(EncryptedDuplexStream<Box<dyn Stream>>) + Sync + Send,
-        ClientF: 'static + Fn(EncryptedDuplexStream<Box<dyn Stream>>) + Sync + Send,
+        ServeF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
+        ClientF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
     >(
         sf: ServeF,
         cf: ClientF,
@@ -270,18 +301,14 @@ mod tests {
 
         server_client_generic(
             move |stream| {
-                sf(
-                    EncryptedDuplexStream::responder_handshake(stream, &server_sk)
-                        .wait()
-                        .unwrap(),
-                )
+                sf(EncStream::responder_handshake(stream, &server_sk)
+                    .wait()
+                    .unwrap())
             },
             move |stream| {
-                cf(
-                    EncryptedDuplexStream::initiatior_handshake(stream, &client_sk)
-                        .wait()
-                        .unwrap(),
-                )
+                cf(EncStream::initiatior_handshake(stream, &client_sk)
+                    .wait()
+                    .unwrap())
             },
         );
     }
