@@ -3,12 +3,13 @@
 set -euo pipefail
 shopt -s expand_aliases
 
-panic(){
-    RED="\033[0;31m"
-    NC='\033[0m' # No Color
+ERROR_HAPPENED=0
 
+error() {
+	RED="\033[0;31m"
+    NC='\033[0m' # No Color
     printf "${RED}${@}${NC}\n"
-	exit 1
+	ERROR_HAPPENED=1
 }
 
 # binary to hex
@@ -25,38 +26,38 @@ alias shasum='shasum -b'
 scat generate > scat_keypair_server
 scat generate > scat_keypair_client
 
-server_payload=$(head -c 10000 /dev/random | rbtohex)
-client_payload=$(head -c 10000 /dev/random | rbtohex)
+head -c 1000000 /dev/random > server_payload
+head -c 1000000 /dev/random > client_payload
+
+server_psha=$(cat server_payload | shasum)
+client_psha=$(cat client_payload | shasum)
 
 server() {
-	got=$(echo -n $server_payload \
-			| scat listen scat_keypair_server 3333 $(scat getpub scat_keypair_client))
-	if [[ $got == $client_payload ]]
+	got=$(cat server_payload \
+			  | scat listen scat_keypair_server 3333 $(scat getpub scat_keypair_client) \
+			  | shasum)
+	if [[ $got == $client_psha ]]
 	then
 		echo server done
 	else
-		panic Server Err
+		error Server Err
 	fi
 }
 
 client() {
-	got=$(echo -n $client_payload \
-			  | scat connect scat_keypair_client 127.0.0.1:3333 $(scat getpub scat_keypair_server))
-	if [[ $got == $server_payload ]]
+	got=$(cat client_payload \
+			  | scat connect scat_keypair_client 127.0.0.1:3333 $(scat getpub scat_keypair_server) \
+			  | shasum) 
+	if [[ $got == $server_psha ]]
 	then
 		echo client done
 	else
-		panic Client Err
+		error Client Err
 	fi
 }
 
-server &
-spid=$!
+server & ( sleep 0.1; client )
 
-sleep 0.1; # feed the race condition
+wait
 
-client &
-cpid=$!
-
-wait $spid
-wait $cpid
+exit $ERROR_HAPPENED

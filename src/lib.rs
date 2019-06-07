@@ -10,16 +10,20 @@ pub use crate::keys::{generate_keypair, PublicKey, SecretKey};
 use crate::builder::builder;
 use crate::crypt::decrypt_read;
 use crate::crypt::encrypt_write;
+use crate::fragment::read_noise;
+use crate::fragment::write_noise;
 use either::Either;
 use futures::io::{ReadHalf, WriteHalf};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use snow::error::SnowError;
 use std::io;
+use std::rc::Rc;
+use std::sync::Mutex;
 
 /// Transformation on a read write stream, encrypts reads and writes.
 pub struct EncStream<Stream> {
     underlying: Stream,
-    session: snow::Session,
+    session: Rc<Mutex<snow::Session>>,
 }
 
 impl<Stream: Unpin> EncStream<Stream> {
@@ -49,7 +53,9 @@ impl<Stream: Unpin> EncStream<Stream> {
 
         Ok(EncStream {
             underlying: stream,
-            session: session.into_transport_mode().map_err(Either::Right)?,
+            session: Rc::new(Mutex::new(
+                session.into_transport_mode().map_err(Either::Right)?,
+            )),
         })
     }
 
@@ -77,7 +83,9 @@ impl<Stream: Unpin> EncStream<Stream> {
 
         Ok(EncStream {
             underlying: stream,
-            session: session.into_transport_mode().map_err(Either::Right)?,
+            session: Rc::new(Mutex::new(
+                session.into_transport_mode().map_err(Either::Right)?,
+            )),
         })
     }
 
@@ -85,6 +93,8 @@ impl<Stream: Unpin> EncStream<Stream> {
     pub fn get_remote_static(&self) -> PublicKey {
         PublicKey::from_slice(
             self.session
+                .lock()
+                .expect("Noise session poisioned.")
                 .get_remote_static()
                 .expect("remote static key not set"),
         )
@@ -97,7 +107,7 @@ impl<Stream: Unpin> EncStream<Stream> {
     where
         Stream: AsyncWrite,
     {
-        encrypt_write(&mut self.underlying, &mut self.session, message).await
+        encrypt_write(&mut self.underlying, &self.session, message).await
     }
 
     pub async fn recv<'a>(
@@ -111,7 +121,7 @@ impl<Stream: Unpin> EncStream<Stream> {
     }
 
     /// Split stream into a read half and a write half.
-    fn split(self) -> (EncStream<ReadHalf<Stream>>, EncStream<WriteHalf<Stream>>)
+    pub fn split(self) -> (EncStream<ReadHalf<Stream>>, EncStream<WriteHalf<Stream>>)
     where
         Stream: AsyncWrite + AsyncRead,
     {
@@ -119,11 +129,11 @@ impl<Stream: Unpin> EncStream<Stream> {
         (
             EncStream {
                 underlying: read,
-                session: self.session,
+                session: self.session.clone(),
             },
             EncStream {
                 underlying: write,
-                session: unimplemented!(),
+                session: self.session,
             },
         )
     }
@@ -136,8 +146,13 @@ async fn handshake_recv<'a, R: AsyncRead + Unpin>(
     session: &'a mut snow::Session,
 ) -> Result<(), Either<io::Error, SnowError>> {
     debug_assert!(is_handshake_state(session));
+    let mut buf = [0u8; 65535];
     let mut trash = [0u8; 65519];
-    decrypt_read(stream, session, &mut trash).await.map(|_| ())
+    let len = read_noise(stream, &mut buf).await.map_err(Either::Left)?;
+    session
+        .read_message(&buf[..len], &mut trash)
+        .map_err(Either::Right)
+        .map(|_| ())
 }
 
 async fn handshake_send<'a, W: AsyncWrite + Unpin>(
@@ -145,7 +160,11 @@ async fn handshake_send<'a, W: AsyncWrite + Unpin>(
     session: &'a mut snow::Session,
 ) -> Result<(), io::Error> {
     debug_assert!(is_handshake_state(session));
-    encrypt_write(stream, session, &[]).await
+    let mut buf = [0u8; 65535];
+    let len = session
+        .write_message(&[], &mut buf)
+        .expect("Output exceeded the max message length for the Noise Protocol (65535 bytes).");
+    write_noise(stream, &buf[..len]).await
 }
 
 fn is_handshake_state(session: &snow::Session) -> bool {
@@ -160,6 +179,7 @@ mod tests {
     use super::*;
     use crate::keys::generate_keypair;
     use futures::executor::block_on;
+    use futures::future::join;
     use futures_util::stream::StreamExt;
     use romio::{TcpListener, TcpStream};
     use std::future::Future;
@@ -324,6 +344,43 @@ mod tests {
                 for _ in 0..100 {
                     encstream.send(&[2u8; 65519]).wait().unwrap();
                 }
+            },
+        );
+    }
+
+    #[test]
+    fn split() {
+        // read and write at the same time
+        let iterations = 100;
+
+        server_client_post_handshake(
+            move |encstream| {
+                // echo server
+                let mut buf = [0u8; 65519];
+                let (mut inp, mut outp) = encstream.split();
+                block_on(async {
+                    for _ in 0..iterations {
+                        let len = inp.recv(&mut buf).await.expect("server failed to recieve");
+                        outp.send(&buf[..len]).await.expect("server failed to send");
+                    }
+                });
+            },
+            move |encstream| {
+                let (mut inp, mut outp) = encstream.split();
+                block_on(join(
+                    async {
+                        for _ in 0..iterations {
+                            outp.send(b"hello").await.unwrap();
+                        }
+                    },
+                    async {
+                        let mut buf = [0u8; 65519];
+                        for _ in 0..iterations {
+                            let len = inp.recv(&mut buf).await.unwrap();
+                            assert_eq!(buf[..len], b"hello"[..]);
+                        }
+                    },
+                ));
             },
         );
     }

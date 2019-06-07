@@ -7,6 +7,7 @@ mod encoding;
 use crate::encoding::{pk_from_hex, pk_to_hex};
 use encstream::{generate_keypair, EncStream, PublicKey, SecretKey};
 use futures::executor::block_on;
+use futures::future::join;
 use futures::{AsyncRead, AsyncWrite};
 use futures_util::stream::StreamExt;
 use romio::TcpListener;
@@ -99,25 +100,23 @@ async fn async_main() {
 
             // accept connections until a connection from authorized_host is recieved
             let mut incoming = listener.incoming();
-            while let Some(tcp_stream) = incoming
-                .next()
-                .await
-                .map(|tcp_stream| tcp_stream.expect("error listening for tcp connection"))
-            {
-                match EncStream::responder_handshake(tcp_stream, &sk).await {
-                    Ok(mut enc_stream) => {
-                        if enc_stream.get_remote_static() == authorized_host {
-                            // xfer
-                            let mut inp = io::stdin();
-                            let mut out = io::stdout();
-                            recv(&mut out, &mut enc_stream).await;
-                            send(&mut inp, &mut enc_stream).await;
-                            break;
+            let enc_stream = loop {
+                if let Some(tcp_stream) = incoming.next().await {
+                    let tcp_stream = tcp_stream.expect("error initiating tcp connection");
+                    match EncStream::responder_handshake(tcp_stream, &sk).await {
+                        Ok(enc_stream) => {
+                            if enc_stream.get_remote_static() == authorized_host {
+                                break enc_stream;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                } else {
+                    panic!("listener error");
                 }
-            }
+            };
+
+            xfer(enc_stream).await;
         }
         Opt::Connect {
             path_to_keypair,
@@ -133,7 +132,7 @@ async fn async_main() {
                 .expect("cannot connect to remote host");
 
             // panic if hanshake fails
-            let mut enc_stream = EncStream::initiatior_handshake(tcp_stream, &sk)
+            let enc_stream = EncStream::initiatior_handshake(tcp_stream, &sk)
                 .await
                 .expect("handshake failed");
 
@@ -142,11 +141,7 @@ async fn async_main() {
                 panic!("remote public key does not match specified public key, aborting");
             }
 
-            // xfer
-            let mut inp = io::stdin();
-            let mut out = io::stdout();
-            send(&mut inp, &mut enc_stream).await;
-            recv(&mut out, &mut enc_stream).await;
+            xfer(enc_stream).await;
         }
     }
 }
@@ -162,7 +157,15 @@ fn load_keypair(path: &PathBuf) -> Keypair {
     retp
 }
 
-async fn send<'a, R: io::Read, Stream: AsyncWrite + AsyncRead + Unpin>(
+async fn xfer<S: AsyncWrite + AsyncRead + Unpin>(stream: EncStream<S>) {
+    // xfer
+    let mut inp = io::stdin();
+    let mut out = io::stdout();
+    let (mut enc_inp, mut enc_out) = stream.split();
+    join(send(&mut inp, &mut enc_out), recv(&mut out, &mut enc_inp)).await;
+}
+
+async fn send<'a, R: io::Read, Stream: AsyncWrite + Unpin>(
     inp: &'a mut R,
     stream: &'a mut EncStream<Stream>,
 ) {
@@ -178,13 +181,13 @@ async fn send<'a, R: io::Read, Stream: AsyncWrite + AsyncRead + Unpin>(
         }
         debug_assert_eq!(buf[0], 0);
         stream
-            .send(&buf[..(len + 1)])
+            .send(&buf[..len + 1])
             .await
             .expect("error sending to stream");
     }
 }
 
-async fn recv<'a, W: io::Write, Stream: AsyncWrite + AsyncRead + Unpin>(
+async fn recv<'a, W: io::Write, Stream: AsyncRead + Unpin>(
     out: &'a mut W,
     stream: &'a mut EncStream<Stream>,
 ) {
@@ -200,6 +203,7 @@ async fn recv<'a, W: io::Write, Stream: AsyncWrite + AsyncRead + Unpin>(
         if buf[0] != 0 {
             break;
         }
-        out.write_all(&buf[1..]).expect("error writing to output");
+        out.write_all(&buf[1..len])
+            .expect("error writing to output");
     }
 }
