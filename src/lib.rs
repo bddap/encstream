@@ -17,13 +17,13 @@ use futures::io::{ReadHalf, WriteHalf};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use snow::error::SnowError;
 use std::io;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 /// Transformation on a read write stream, encrypts reads and writes.
 pub struct EncStream<Stream> {
     underlying: Stream,
-    session: Rc<Mutex<snow::Session>>,
+    session: Arc<Mutex<snow::Session>>,
 }
 
 impl<Stream: Unpin> EncStream<Stream> {
@@ -53,7 +53,7 @@ impl<Stream: Unpin> EncStream<Stream> {
 
         Ok(EncStream {
             underlying: stream,
-            session: Rc::new(Mutex::new(
+            session: Arc::new(Mutex::new(
                 session.into_transport_mode().map_err(Either::Right)?,
             )),
         })
@@ -83,7 +83,7 @@ impl<Stream: Unpin> EncStream<Stream> {
 
         Ok(EncStream {
             underlying: stream,
-            session: Rc::new(Mutex::new(
+            session: Arc::new(Mutex::new(
                 session.into_transport_mode().map_err(Either::Right)?,
             )),
         })
@@ -228,7 +228,7 @@ mod tests {
         client.join().expect("client thread panicked");
     }
 
-    trait Stream: AsyncRead + AsyncWrite + Unpin {}
+    trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
     impl Stream for TcpStream {}
 
     fn server_client_generic<
@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn server_client_post_handshake<
-        ServeF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
+            ServeF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
         ClientF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
     >(
         sf: ServeF,
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn split() {
-        // read and write at the same time
+        // Echo server using split stream
         let iterations = 100;
 
         server_client_post_handshake(
@@ -383,5 +383,46 @@ mod tests {
                 ));
             },
         );
+    }
+
+    // Make sure write and read can happen simultaneously on a split stream.
+    #[test]
+    fn simultaneous_write() {
+        use std::time;
+
+        // Begin write operations on both sides before starting reads
+
+        let iterations = 1_000;
+
+        let write_then_read = move |encstream: EncStream<Box<dyn Stream + 'static>>| {
+            let to_send = vec![1u8; 65519];
+            
+            let (mut read, mut write) = encstream.split();
+
+            // start write thread
+            let wt = thread::spawn(move || {
+                for _ in 0..iterations {
+                    write.send(&to_send).wait().unwrap();
+                }
+            });
+
+            // start read thread
+            let mut trash = Box::new([0u8; 65519]);
+            thread::sleep(time::Duration::from_millis(10));
+            for _ in 0..iterations {
+                read.recv(&mut trash).wait().unwrap();
+            }
+
+            wt.join().expect("write thread failed");
+        };
+
+        server_client_post_handshake(write_then_read, write_then_read);
+
+        // When compiled in release mode, this test transfers 247MiBs on my 2015 i7.
+        // This implies that noise stream cyphers will not be a bottleneck unless
+        // network capacity is on the order of 247MiBs.
+
+        // This test spawns a four threads: server send, server recv, client send, client recv
+        // Each thread runs at 60% capacity on my 2015 i7. Syscalls are likely the bottleneck.
     }
 }
