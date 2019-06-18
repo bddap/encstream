@@ -1,4 +1,7 @@
-Requires Futures and async/await which are currently only available on nightly.
+# Encrypted, authenticated, async streams atop async read write streams.
+
+Requires Futures and async/await which are currently only available on nightly
+(as of june 2019).
 
 ```
 alias scat='rustup run nightly cargo run --example scat'

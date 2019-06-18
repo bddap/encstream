@@ -1,4 +1,7 @@
 //! Secure netcat
+//!
+//! This example has a bug with blocking io in stdout. As a result, large transfers fail.
+//! PRs welcome.
 
 #![feature(async_await)]
 
@@ -54,8 +57,6 @@ enum Opt {
         remote_public_key: PublicKey,
     },
 }
-
-// scat listen <secret-key-file> <port>
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Keypair {

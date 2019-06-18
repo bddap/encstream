@@ -3,3 +3,4 @@
 Cargo.lock
 tmp
 .DS_Store
+rust-toolchain
