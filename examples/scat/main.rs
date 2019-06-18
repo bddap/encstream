@@ -1,5 +1,11 @@
 //! Secure netcat
 
+// This example uses futures to some extent, but file io doesn't play well with futures yet
+// so reading from stdin and writing to stdout are performed as blocking opterations on separate
+// threads.
+//
+// Solutions like https://crates.io/crates/futures-fs exists, but add complexity.
+
 #![feature(async_await)]
 
 mod encoding;
@@ -7,7 +13,6 @@ mod encoding;
 use crate::encoding::{pk_from_hex, pk_to_hex};
 use encstream::{generate_keypair, EncStream, PublicKey, SecretKey};
 use futures::executor::block_on;
-use futures::future::join;
 use futures::{AsyncRead, AsyncWrite};
 use futures_util::stream::StreamExt;
 use romio::TcpListener;
@@ -18,6 +23,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::thread;
 use structopt::StructOpt;
 
 #[derive(Debug, StructOpt)]
@@ -114,7 +120,8 @@ async fn async_main() {
                 }
             };
 
-            xfer(enc_stream).await;
+            // This line is inappropriate. An async funciton should not perform blocking io.
+            xfer(enc_stream);
         }
         Opt::Connect {
             path_to_keypair,
@@ -139,7 +146,8 @@ async fn async_main() {
                 panic!("remote public key does not match specified public key, aborting");
             }
 
-            xfer(enc_stream).await;
+            // This line is inappropriate. An async funciton should not perform blocking io.
+            xfer(enc_stream);
         }
     }
 }
@@ -155,12 +163,19 @@ fn load_keypair(path: &PathBuf) -> Keypair {
     retp
 }
 
-async fn xfer<S: AsyncWrite + AsyncRead + Unpin>(stream: EncStream<S>) {
+/// Write stream output to stdout and stream input to stdin. Block until both operations are
+/// complete.
+fn xfer<S: 'static + AsyncWrite + AsyncRead + Unpin + Send>(stream: EncStream<S>) {
     // xfer
     let mut inp = io::stdin();
     let mut out = io::stdout();
     let (mut enc_inp, mut enc_out) = stream.split();
-    join(send(&mut inp, &mut enc_out), recv(&mut out, &mut enc_inp)).await;
+    let send = thread::spawn(move || block_on(send(&mut inp, &mut enc_out)));
+    let recv = thread::spawn(move || block_on(recv(&mut out, &mut enc_inp)));
+    let sr = send.join();
+    let rr = recv.join();
+    sr.expect("send thread panicked");
+    rr.expect("send thread panicked");
 }
 
 async fn send<'a, R: io::Read, Stream: AsyncWrite + Unpin>(
@@ -169,6 +184,7 @@ async fn send<'a, R: io::Read, Stream: AsyncWrite + Unpin>(
 ) {
     let mut buf = [0u8; 65519];
     loop {
+        // This line is inappropriate. An async funciton should not perform blocking io.
         let len = inp.read(&mut buf[1..]).expect("error reading from input");
         if len == 0 {
             stream
@@ -201,6 +217,7 @@ async fn recv<'a, W: io::Write, Stream: AsyncRead + Unpin>(
         if buf[0] != 0 {
             break;
         }
+        // This line is inappropriate. An async funciton should not perform blocking io.
         out.write_all(&buf[1..len])
             .expect("error writing to output");
     }

@@ -310,7 +310,7 @@ mod tests {
     }
 
     fn server_client_post_handshake<
-            ServeF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
+        ServeF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
         ClientF: 'static + Fn(EncStream<Box<dyn Stream>>) + Sync + Send,
     >(
         sf: ServeF,
@@ -396,7 +396,7 @@ mod tests {
 
         let write_then_read = move |encstream: EncStream<Box<dyn Stream + 'static>>| {
             let to_send = vec![1u8; 65519];
-            
+
             let (mut read, mut write) = encstream.split();
 
             // start write thread
