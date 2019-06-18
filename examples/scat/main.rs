@@ -1,7 +1,4 @@
 //! Secure netcat
-//!
-//! This example has a bug with blocking io in stdout. As a result, large transfers fail.
-//! PRs welcome.
 
 #![feature(async_await)]
 
