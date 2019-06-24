@@ -163,8 +163,8 @@ fn load_keypair(path: &PathBuf) -> Keypair {
     retp
 }
 
-/// Write stream output to stdout and stream input to stdin. Block until both operations are
-/// complete.
+/// Write stream output to stdout and stream input to stdin. Block until both
+/// operations are complete.
 fn xfer<S: 'static + AsyncWrite + AsyncRead + Unpin + Send>(stream: EncStream<S>) {
     // xfer
     let mut inp = io::stdin();

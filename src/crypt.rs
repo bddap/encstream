@@ -3,17 +3,22 @@
 use crate::fragment::{read_noise, write_noise};
 use either::Either;
 use futures::{AsyncRead, AsyncWrite};
-use snow::{error::SnowError, Session};
+use snow::error::SnowError;
+use snow::Session;
 use std::io;
 use std::sync::Mutex;
 
+/// # Panics
+///
+/// Panics if length of plaintext is > 65519
 pub async fn encrypt_write<'a, W: AsyncWrite + Unpin>(
     w: &'a mut W,
     session: &'a Mutex<Session>,
     plaintext: &'a [u8],
 ) -> Result<(), io::Error> {
     assert!(plaintext.len() <= 65519);
-    let mut buf = Box::new([0u8; 65535]); // 65535 is a bit large for the stack, some experiments resulted in stack overflow
+    let mut buf = Box::new([0u8; 65535]); // 65535 is a bit large for the stack, some experiments resulted in stack
+                                          // overflow
     let len = session
         .lock()
         .expect("Noise session poisioned.")
